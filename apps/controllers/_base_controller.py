@@ -1,0 +1,34 @@
+from flask import Request
+from flask_restx import Resource
+import math
+
+class BaseController(Resource):
+    @staticmethod
+    def paginate(request:Request, query):
+        page = request.args.get('page', default=1, type=int)
+        limit = request.args.get('limit', default=15, type=int)
+        offset = (page - 1) * limit
+        total = query.count()
+        data = query.offset(offset).limit(limit).all()
+        total_page = math.ceil(total / limit)
+        paginate = {
+            'current_page': page,
+            'data': [item.to_dict() for item in data],
+            'total_page': total_page,
+            'next_page': total_page if page + 1 >= total_page else page + 1
+        }
+        return paginate
+
+    @staticmethod
+    def json_response(data=None, status_code=200, message=None):
+        response = {
+            'status':status_code,
+            'message':message,
+            'context': data
+        }
+        return response, status_code
+
+    @staticmethod
+    def handle_error(error_msg='Server error', status_code=500):
+        return {"message": error_msg}, status_code
+
