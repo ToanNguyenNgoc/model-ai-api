@@ -1,4 +1,5 @@
 from flask import Request
+from flask import request as route_request
 from flask_restx import Resource
 import math
 
@@ -31,4 +32,8 @@ class BaseController(Resource):
     @staticmethod
     def handle_error(error_msg='Server error', status_code=500):
         return {"message": error_msg}, status_code
+
+    @staticmethod
+    def get_request():
+        return route_request.json
 

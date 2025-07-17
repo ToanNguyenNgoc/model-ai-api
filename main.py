@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import os
 from flask_restx import Api
-
 from apps.configs.mysql_config import MysqlConfig
 from apps.route.route import Route
 
