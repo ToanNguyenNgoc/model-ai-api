@@ -4,10 +4,12 @@ import os
 from flask_restx import Api
 from apps.configs.mysql_config import MysqlConfig
 from apps.route.route import Route
+from flask_cors import CORS
 
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 api = Api(
     app,
