@@ -4,6 +4,8 @@ from apps.dto.user_dto import UserDto
 from apps.controllers import user_controller
 from apps.dto.bot_dto import BotDto
 from apps.controllers import bot_controller
+from apps.dto.media_dto import MediaDto
+from apps.controllers import media_controller
 
 class Route:
     def __init__(self, api):
@@ -13,6 +15,7 @@ class Route:
         self.api.add_namespace(AuthDto.api, path='/api/auth')
         self.api.add_namespace(UserDto.api, path='/api/users')
         self.api.add_namespace(BotDto.api, path='/api/bots')
+        self.api.add_namespace(MediaDto.api, path='/api/media')
         
         return
 
