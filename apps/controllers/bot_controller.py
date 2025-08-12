@@ -107,8 +107,11 @@ class MessageV2(BaseController, Resource):
     @BotDto.api.expect(BotDto.post_message, validate=True)
     def post(self):
         # Input
+        req = self.get_request() or {} 
         message = self.get_request()['message']
-        user_id = self.get_request()['user_id']
+        # user_id = self.get_request()['user_id'] or 123
+        raw_user_id = req.get('user_id')
+        user_id = user_id = raw_user_id or 123
         conversation_key = f"chat:{user_id}"
         history = cache.get(conversation_key) or []
         history.append({"role": "user", "content": message})
