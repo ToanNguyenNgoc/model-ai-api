@@ -2,6 +2,8 @@ from flask import Request
 from flask import request as route_request
 from flask_restx import Resource
 import math
+from flask_jwt_extended import (get_jwt_identity)
+from apps.models.user_model import UserModel
 
 class BaseController(Resource):
     @staticmethod
@@ -37,3 +39,11 @@ class BaseController(Resource):
     def get_request():
         return route_request.json
 
+    @staticmethod
+    def on_user():
+        try:
+            user_id = get_jwt_identity()
+            user_response = UserModel.query.filter_by(id=int(user_id)).first()
+            return user_response
+        except:
+            BaseController.json_response(None,401,'Unauthorized')

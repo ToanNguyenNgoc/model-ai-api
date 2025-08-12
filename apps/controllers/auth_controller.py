@@ -3,6 +3,10 @@ from apps.dto.auth_dto import AuthDto
 from flask import request
 from apps.models.user_model import UserModel
 import bcrypt
+from flask_jwt_extended import (create_access_token, get_jwt_identity)
+from apps.middlewares.auth_middleware import auth_required
+from apps.utils.constaint import CONSTANT
+
 
 @AuthDto.api.route('/login')
 class Login(BaseController):
@@ -21,4 +25,14 @@ class Login(BaseController):
       laravel_hash = b"$2b$" + laravel_hash[4:]
     if not bcrypt.checkpw(password.encode(), laravel_hash):
       return self.json_response(None, 403, 'Password incorrect')
+    access_token = create_access_token(identity=str(user.id))
+    user_response = user.to_dict()
+    return self.json_response({**user_response, 'access_token': access_token})
+
+@AuthDto.api.route('/profile')
+class Profile(BaseController):
+  @AuthDto.api.doc(security=CONSTANT.bearer_token)
+  @auth_required()
+  def get(self):
+    user = self.on_user()
     return self.json_response(user.to_dict())

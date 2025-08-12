@@ -1,25 +1,25 @@
-from flask import Flask, request, jsonify
+from flask import Flask
 from dotenv import load_dotenv
 import os
-from flask_restx import Api
 from apps.configs.mysql_config import MysqlConfig
+from apps.configs.api_doc_config import ApiDocConfig
 from apps.route.route import Route
-from flask_cors import CORS
+from flask_jwt_extended import JWTManager
+from apps.configs.config import Config
+from apps.configs.cors_config import CORSConfig
+from apps.extensions import cache
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+app.config.from_object(Config)
 
-api = Api(
-    app,
-    version='1.0',
-    title='Myspa Model AI API',
-    description='A simple API',
-    url_prefix='/api/docs'
-)
+CORSConfig(app).instance()
+api_doc = ApiDocConfig(app).instance()
 MysqlConfig(app).connection()
-Route(api).instance()
+Route(api_doc).instance()
+JWTManager(app)
+cache.init_app(app)
 @app.route('/')
 def index():
     return 'Home'
