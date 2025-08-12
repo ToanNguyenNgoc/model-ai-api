@@ -9,11 +9,12 @@ from apps.extensions import cache
 from apps.utils.spa_locations import spa_locations
 from apps.utils.spa_services import spa_services
 from openai import OpenAI
+from apps.vector.parse_time_text import ParseTimeText
 
 
 class TrainingVector(BaseController):
     def __init__(self):
-        pass
+        self.dt_parser = ParseTimeText()
 
     # ===== Storage / common =====
     def finalize_reply(self, reply, conversation_key, history):
@@ -310,6 +311,18 @@ class TrainingVector(BaseController):
                         found.append({"spa_name": spa_name, "service": s})
         return found
 
+    def reply_choose_service_for_spa(self, spa_name, service_names, conversation_key, history):
+        if not service_names:
+            return self.finalize_reply(
+                f"Hiện **{spa_name}** chưa có danh sách dịch vụ. Bạn có thể nhắn tên dịch vụ muốn đặt không?",
+                conversation_key, history
+            )
+        lines = [f"Bạn muốn đặt **dịch vụ** nào tại **{spa_name}**:"]
+        for i, name in enumerate(service_names, 1):
+            lines.append(f"{i}. {name}")
+        lines.append("Vui lòng trả lời **số thứ tự** hoặc **tên dịch vụ**.")
+        return self.finalize_reply("\n".join(lines), conversation_key, history)
+
     def get_available_slots(self, spa_name):
         base = datetime.now(); opts = []
         for d in range(1, 4):
@@ -327,6 +340,7 @@ class TrainingVector(BaseController):
         return self.finalize_reply("\n".join(reply), conversation_key, history)
 
     def parse_datetime_from_message(self, message):
+        # return self.dt_parser.parse(message)
         m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})", message.strip())
         if not m: return None
         try:
@@ -392,6 +406,61 @@ class TrainingVector(BaseController):
             f"- Khách hàng: {ctx['customer_name']} — {ctx['phone']}\n"
             "Hẹn gặp bạn tại spa!"
         )
+    
+    # === Appointment ===
+    def is_request_for_my_appointments(self, message: str) -> bool:
+        msg = self._normalize(message)
+        keys = [
+            "danh sach lich hen", "danh sach lich hen cua toi", "lich hen cua toi",
+            "xem lich hen", "xem dat lich", "xem dat hen", "booking cua toi",
+            "cac lich hen cua toi", "lich hen da dat", "lich hen cua minh"
+        ]
+        return any(k in msg for k in keys)
+
+    def add_appointment(self, user_id: str, ctx: dict):
+        """
+        Lưu lịch hẹn sau khi user xác nhận. Mỗi lịch có id đơn giản theo timestamp.
+        """
+        appt_key = f"appointments:{user_id}"
+        appts = cache.get(appt_key) or []
+        appt_id = f"APPT-{int(datetime.now().timestamp())}"
+        appts.append({
+            "id": appt_id,
+            "spa_name": ctx.get("spa_name"),
+            "service_name": ctx.get("service_name"),
+            "slot_label": ctx.get("slot", {}).get("label"),
+            "slot_iso": ctx.get("slot", {}).get("iso"),
+            "customer_name": ctx.get("customer_name"),
+            "phone": ctx.get("phone"),
+            "created_at": datetime.now().isoformat()
+        })
+        cache.set(appt_key, appts, timeout=30 * 24 * 3600)  # giữ 30 ngày
+        return appt_id
+
+    def get_appointments(self, user_id: str):
+        return cache.get(f"appointments:{user_id}") or []
+
+    def reply_my_appointments(self, user_id: str, conversation_key: str, history: list):
+        appts = self.get_appointments(user_id)
+        if not appts:
+            return self.finalize_reply("Hiện bạn **chưa có lịch hẹn** nào trong hệ thống.", conversation_key, history)
+
+        # sắp xếp theo thời gian (nếu có slot_iso)
+        def key_func(a):
+            try:
+                return datetime.fromisoformat(a.get("slot_iso"))
+            except Exception:
+                return datetime.max
+
+        appts_sorted = sorted(appts, key=key_func)
+
+        lines = ["📒 **Lịch hẹn của bạn:**"]
+        for i, a in enumerate(appts_sorted, 1):
+            lines.append(
+                f"{i}. {a.get('slot_label','(chưa rõ)')} — **{a.get('spa_name','?')}** / {a.get('service_name','?')} "
+                f"(SĐT: {a.get('phone','?')})\n   Mã lịch hẹn: `{a.get('id')}`"
+            )
+        return self.finalize_reply("\n".join(lines), conversation_key, history)
 
     # ===== GPT =====
     def is_general_skin_question_gpt(self, message, client: OpenAI):
