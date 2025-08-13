@@ -10,6 +10,7 @@ from apps.utils.spa_locations import spa_locations
 from apps.utils.spa_services import spa_services
 from openai import OpenAI
 from apps.vector.parse_time_text import ParseTimeText
+from zoneinfo import ZoneInfo
 
 
 class TrainingVector(BaseController):
@@ -52,6 +53,36 @@ class TrainingVector(BaseController):
         s = "".join(fold_char(ch) for ch in s)
         s = re.sub(r"\s+", " ", s)
         return s
+    
+    def is_skin_question_local(self, message: str) -> bool:
+        """
+        Nhận diện nhanh các câu skincare chung (mụn, thâm, nám, routine, retinol...).
+        Chỉ trả True nếu KHÔNG có ý định booking/ dịch vụ cụ thể.
+        """
+        msg = self._normalize(message)
+
+        # Từ khóa chủ đề skincare (triệu chứng | routine | hoạt chất | bước skincare)
+        skin_terms = [
+            "mun", "mun an", "mun viem", "mun dau den", "mun dau trang",
+            "tham", "nam", "tan nhang", "lo chan long", "do dau", "da kho",
+            "kich ung", "kich ung da", "viem da",
+            "skincare", "routine", "chuong trinh duong da", "duong am", "tay da chet",
+            "tay trang", "sua rua mat", "cleanser", "toner", "serum", "kem chong nang",
+            "retinol", "tre", "bha", "aha", "paha", "niacinamide", "vitamin c", "ha", "hyaluronic"
+        ]
+        ask_terms = [
+            "lam sao", "nhu the nao", "giai phap", "nen dung", "chi minh", "tu van",
+            "cach tri", "tri nhu the nao", "co nen", "huong dan", "khac phuc", "meo"
+        ]
+
+        has_skin = any(t in msg for t in skin_terms)
+        has_ask  = any(t in msg for t in ask_terms) or "?" in message
+
+        # Không lẫn với booking/dịch vụ
+        is_booking = self.is_booking_request(message)
+        looks_service_list = ("dich vu" in msg) or ("danh sach" in msg) or ("bang gia" in msg)
+
+        return (has_skin and (has_ask or True)) and (not is_booking) and (not looks_service_list)
 
     # ===== City detection =====
     def extract_city_keywords(self, spas):
@@ -77,6 +108,7 @@ class TrainingVector(BaseController):
         return None
 
     # ===== Spa / Service detection =====
+    
     def detect_spa_in_message(self, message, spa_names):
         msg_norm = self._normalize(message)
         for name in spa_names:
@@ -115,6 +147,24 @@ class TrainingVector(BaseController):
         ]
         return any(re.search(p, msg) for p in patterns)
 
+    def is_request_for_service_list(self, message):
+        if self.is_booking_request(message):
+            return False
+        msg = self._normalize(message)
+
+        # Ưu tiên khi có 'dich vu' + ý hỏi/liệt kê
+        if "dich vu" in msg:
+            cues = [" nao", " gi", " tot", "goi y", "danh sach", "liet ke",
+                    "co nhung", "nhung gi", "gom", "bao gom", "goi nao", "nen dung"]
+            if any(c in msg for c in cues):
+                return True
+
+        # Cụm list tường minh
+        if any(c in msg for c in ["danh sach", "liet ke", "bang gia", "bao gia"]):
+            return True
+
+        return False
+    
     def is_additional_booking(self, message: str) -> bool:
         """Nhận diện 'đặt hẹn thêm' để reset context cũ trước khi vào flow mới."""
         msg = self._normalize(message)
@@ -410,13 +460,27 @@ class TrainingVector(BaseController):
 
     # === Appointment ===
     def is_request_for_my_appointments(self, message: str) -> bool:
+        """
+        Chỉ bắt khi:
+        - Có động từ tra cứu + 'lịch hẹn' (xem/kiểm tra/danh sách/liệt kê ... lịch hẹn)
+        HOẶC
+        - Có 'lịch hẹn của tôi/của mình/booking của tôi'
+        → KHÔNG bắt những câu 'đặt hẹn', 'muốn đặt hẹn', ...
+        """
         msg = self._normalize(message)
-        keys = [
-            "danh sach lich hen", "danh sach lich hen cua toi", "lich hen cua toi",
-            "xem lich hen", "xem dat lich", "xem dat hen", "booking cua toi",
-            "cac lich hen cua toi", "lich hen da dat", "lich hen cua minh"
-        ]
-        return any(k in msg for k in keys)
+
+        # 1) cụm sở hữu 'của tôi / của mình' + 'lịch hẹn'
+        if ("lich hen" in msg or "booking" in msg) and any(
+            own in msg for own in ["cua toi", "cua minh", "toi"]
+        ):
+            return True
+
+        # 2) động từ tra cứu + 'lịch hẹn'
+        lookup_verbs = ["xem", "kiem tra", "kiemtra", "danh sach", "liet ke", "liệt kê"]
+        if ("lich hen" in msg or "booking" in msg) and any(v in msg for v in lookup_verbs):
+            return True
+
+        return False
 
     def add_appointment(self, user_id: str, ctx: dict):
         appt_key = f"appointments:{user_id}"
@@ -458,6 +522,292 @@ class TrainingVector(BaseController):
                 f"   Mã lịch hẹn: `{a.get('id')}`"
             )
         return self.finalize_reply("\n".join(lines), conversation_key, history)
+    
+    # ===== Dynamic appointment-range intent =====
+    def _now_vn(self):
+        return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+
+    def _ensure_vn(self, dt: datetime):
+        if dt is None: return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        return dt.astimezone(ZoneInfo("Asia/Ho_Chi_Minh"))
+
+    def _safe_fromiso(self, iso_str: str):
+        try:
+            return datetime.fromisoformat(iso_str)
+        except Exception:
+            return None
+
+    def _add_months(self, d: datetime, months: int):
+        y = d.year + (d.month - 1 + months) // 12
+        m = (d.month - 1 + months) % 12 + 1
+        # clamp day
+        last_day = 28
+        for day in [31,30,29,28]:
+            try:
+                return d.replace(year=y, month=m, day=min(d.day, day))
+            except ValueError:
+                continue
+        return d.replace(year=y, month=m, day=28)
+
+    def _day_range(self, date_obj: datetime):
+        start = date_obj.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return start, end
+
+    def _week_range(self, date_obj: datetime):
+        # tuần bắt đầu Thứ Hai
+        start = (date_obj - timedelta(days=date_obj.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        return start, end
+
+    def _month_range(self, date_obj: datetime):
+        start = date_obj.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = self._add_months(start, 1)
+        return start, end
+
+    def is_appointments_lookup_intent(self, message: str) -> bool:
+        """
+        Ý định xem/kiểm tra lịch hẹn theo mốc thời gian (hôm nay/mai/hôm qua/tuần/tháng/…)
+        hoặc hỏi dạng 'có lịch hẹn ... không'.
+        """
+        msg = self._normalize(message)
+
+        has_calendar = any(k in msg for k in ["lich hen", "dat hen", "booking", "lich"])
+        if not has_calendar:
+            return False
+
+        # Các cụm thời gian phổ biến
+        time_phrases = [
+            "hom nay", "ngay mai", "hom qua",
+            "tuan nay", "tuan sau", "tuan truoc",
+            "thang nay", "thang sau", "thang truoc",
+            "this week", "next week", "last week",
+            "this month", "next month", "last month",
+            "tu ", "toi ", "tới ", "den ", "đến ",  # 'từ ... đến ...'
+            "trong ", "ngay toi", "ngay toi", "tuan toi", "thang toi", "qua", "yesterday", "today", "tomorrow"
+        ]
+        has_time_phrase = any(tp in msg for tp in time_phrases)
+
+        # Câu nghi vấn kiểu 'có ... không'
+        has_yesno_ask = (" co " in f" {msg} ") and (" khong" in msg or " không" in message)
+
+        # Các động từ tra cứu (để mở rộng cover)
+        has_lookup_verb = any(k in msg for k in ["xem", "kiem tra", "kiemtra", "danh sach", "liet ke", "liệt kê"])
+
+        return has_time_phrase or has_yesno_ask or has_lookup_verb
+
+    def parse_appointment_range(self, message: str):
+        """
+        Trả về (start_dt, end_dt, title) nếu nhận ra khoảng thời gian tra cứu; ngược lại None.
+        Hỗ trợ: hôm nay/mai/hôm qua, tuần này/trước/sau, tháng này/trước/sau,
+        'trong N ngày/tuần/tháng tới/qua', 'từ dd/mm[/yyyy] đến dd/mm[/yyyy]'.
+        """
+        msg = self._normalize(message)
+        now = self._now_vn()
+
+        # --- 1) Khoảng ngày dạng "từ ... đến ..."
+        m = re.search(r"tu\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s+(?:den|toi)\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?", msg)
+        if m:
+            d1,m1,y1,d2,m2,y2 = m.groups()
+            y1 = int(y1) if y1 else now.year
+            y2 = int(y2) if y2 else now.year
+            start = self._ensure_vn(datetime(int(y1), int(m1), int(d1), 0, 0))
+            end_day = self._ensure_vn(datetime(int(y2), int(m2), int(d2), 0, 0))
+            end = end_day + timedelta(days=1)  # inclusive day-range
+            title = f"📅 **Lịch hẹn từ {int(d1):02d}/{int(m1):02d} đến {int(d2):02d}/{int(m2):02d}:**"
+            return start, end, title
+
+        # --- 2) Hôm nay / ngày mai / hôm qua
+        if "hom nay" in msg or "today" in msg:
+            s,e = self._day_range(now)
+            return s,e,"📅 **Lịch hẹn hôm nay của bạn:**"
+        if "ngay mai" in msg or "tomorrow" in msg:
+            s = (now + timedelta(days=1))
+            s,e = self._day_range(s)
+            return s,e,"📅 **Lịch hẹn ngày mai của bạn:**"
+        if "hom qua" in msg or "yesterday" in msg:
+            s = (now - timedelta(days=1))
+            s,e = self._day_range(s)
+            return s,e,"📅 **Lịch hẹn hôm qua của bạn:**"
+
+        # --- 3) Tuần này / tuần sau / tuần trước
+        if "tuan nay" in msg or "this week" in msg:
+            s,e = self._week_range(now)
+            end_disp = e - timedelta(days=1)
+            title = f"📅 **Lịch hẹn tuần này ({s.strftime('%d/%m')}–{end_disp.strftime('%d/%m')}):**"
+            return s,e,title
+        if "tuan sau" in msg or "next week" in msg:
+            s,e = self._week_range(now + timedelta(days=7))
+            end_disp = e - timedelta(days=1)
+            title = f"📅 **Lịch hẹn tuần sau ({s.strftime('%d/%m')}–{end_disp.strftime('%d/%m')}):**"
+            return s,e,title
+        if "tuan truoc" in msg or "last week" in msg:
+            s,e = self._week_range(now - timedelta(days=7))
+            end_disp = e - timedelta(days=1)
+            title = f"📅 **Lịch hẹn tuần trước ({s.strftime('%d/%m')}–{end_disp.strftime('%d/%m')}):**"
+            return s,e,title
+
+        # --- 4) Tháng này / tháng sau / tháng trước
+        if "thang nay" in msg or "this month" in msg:
+            s,e = self._month_range(now)
+            end_disp = e - timedelta(days=1)
+            title = f"📅 **Lịch hẹn tháng này ({s.strftime('%m/%Y')}):**"
+            return s,e,title
+        if "thang sau" in msg or "next month" in msg:
+            s,e = self._month_range(self._add_months(now, 1))
+            title = f"📅 **Lịch hẹn tháng sau ({s.strftime('%m/%Y')}):**"
+            return s,e,title
+        if "thang truoc" in msg or "last month" in msg:
+            s,e = self._month_range(self._add_months(now, -1))
+            title = f"📅 **Lịch hẹn tháng trước ({s.strftime('%m/%Y')}):**"
+            return s,e,title
+
+        # --- 5) “trong N ngày/tuần/tháng tới/qua”
+        m = re.search(r"trong\s+(\d+)\s+(ngay|tuan|thang)\s+(toi|toi|tới|sau|qua)", msg)
+        if m:
+            n, unit, dirn = m.groups()
+            n = int(n)
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if unit == "ngay":
+                delta = timedelta(days=n)
+                if dirn in ("qua",):
+                    return start - delta, start, f"📅 **Lịch hẹn {n} ngày qua:**"
+                else:
+                    return start, start + delta, f"📅 **Lịch hẹn {n} ngày tới:**"
+            if unit == "tuan":
+                delta = timedelta(weeks=n)
+                if dirn in ("qua",):
+                    return start - delta, start, f"📅 **Lịch hẹn {n} tuần qua:**"
+                else:
+                    return start, start + delta, f"📅 **Lịch hẹn {n} tuần tới:**"
+            if unit == "thang":
+                if dirn in ("qua",):
+                    s = self._add_months(start, -n)
+                    return s, start, f"📅 **Lịch hẹn {n} tháng qua:**"
+                else:
+                    e = self._add_months(start, n)
+                    return start, e, f"📅 **Lịch hẹn {n} tháng tới:**"
+
+        # Không nhận ra
+        return None
+
+    def reply_my_appointments_in_range(self, user_id: str, start: datetime, end: datetime, title: str, conversation_key: str, history: list):
+        appts = self.get_appointments(user_id)
+        items = []
+        if appts:
+            s_vn, e_vn = self._ensure_vn(start), self._ensure_vn(end)
+            for a in appts:
+                dt = self._safe_fromiso(a.get("slot_iso"))
+                if not dt: continue
+                dvn = self._ensure_vn(dt)
+                if s_vn <= dvn < e_vn:
+                    items.append(a)
+            items.sort(key=lambda x: self._ensure_vn(self._safe_fromiso(x.get("slot_iso"))) or datetime.max)
+
+        if not items:
+            return self.finalize_reply(f"{title}\nKhông có lịch hẹn nào trong khoảng thời gian này.", conversation_key, history)
+
+        lines = [title]
+        for i, a in enumerate(items, 1):
+            lines.append(
+                f"{i}. {a.get('slot_label','(chưa rõ)')} — **{a.get('spa_name','?')}** / {a.get('service_name','?')}\n"
+                f"   Mã lịch hẹn: `{a.get('id')}`"
+            )
+        return self.finalize_reply("\n".join(lines), conversation_key, history)
+    def reset_time_if_not_in_message(self, ctx: dict, message: str):
+        """Xoá slot/available_slots nếu tin nhắn hiện tại không có thời gian.
+        Tránh việc dùng nhầm slot từ context cũ."""
+        if self.parse_datetime_from_message(message) is None:
+            ctx.pop("slot", None)
+            ctx.pop("available_slots", None)
+            # tuỳ chọn: đánh dấu nguồn slot
+            ctx.pop("slot_source", None)
+        return ctx
+    
+    # --- alias helpers ---
+    def _acronym(self, s: str) -> str:
+        # Lấy chữ cái đầu mỗi từ viết hoa hoặc từ có chữ cái
+        parts = re.findall(r"[A-Za-zÀ-Ỵà-ỵ]+", s)
+        ac = "".join(p[0] for p in parts if p)
+        return ac.upper()
+
+    def build_spa_alias_index(self, spa_names):
+        """
+        Trả về dict: {alias_norm: canonical_spa_name}
+        Cache 1 ngày để tái dùng.
+        """
+        cache_key = "spa_alias_index_v1"
+        alias_map = cache.get(cache_key)
+        if alias_map:
+            return alias_map
+
+        alias_map = {}
+        for name in spa_names:
+            norm_full = self._normalize(name)                # "tham my vien pmt"
+            tokens = [t for t in norm_full.split() if t not in ("spa", "tham", "my", "vien", "tmv")]
+            last_tok = tokens[-1] if tokens else None        # "pmt" / "serenity" / "bella" ...
+            ac = self._acronym(name) or None                 # "PMT"
+
+            # Tập alias gốc
+            aliases = {
+                norm_full,
+                norm_full.replace(" spa", "").replace("tmv ", "").strip(),
+            }
+
+            # Alias theo hậu tố
+            if last_tok and len(last_tok) >= 3:
+                aliases.add(last_tok)
+
+            # Alias acronym (PMT…)
+            if ac and len(ac) >= 2:
+                aliases.add(ac.lower())
+
+            # Biến thể có/bỏ từ 'spa'
+            aliases.add(("spa " + (last_tok or "")).strip())
+            if last_tok:
+                aliases.add((last_tok + " spa").strip())
+
+            # Lưu vào map
+            for a in aliases:
+                a_norm = self._normalize(a)
+                if a_norm:
+                    alias_map[a_norm] = name
+
+        cache.set(cache_key, alias_map, timeout=86400)
+        return alias_map
+
+    def detect_spa_in_message(self, message, spa_names):
+        """
+        Ưu tiên match alias (PMT, Serenity...) -> trả về tên spa chuẩn.
+        Fallback: chứa nguyên tên bỏ dấu; fuzzy nhẹ khi cần.
+        """
+        msg_norm = self._normalize(message)
+        alias_map = self.build_spa_alias_index(spa_names)
+
+        # 1) match theo alias (ưu tiên)
+        hits = []
+        for alias_norm, canonical in alias_map.items():
+            # match theo word-boundary để tránh trùng lặp bậy
+            if re.search(rf"\b{re.escape(alias_norm)}\b", msg_norm):
+                hits.append((len(alias_norm), canonical))
+        if hits:
+            # chọn alias dài nhất để giảm mơ hồ
+            hits.sort(reverse=True)
+            return hits[0][1]
+
+        # 2) chứa nguyên tên đầy đủ (bỏ dấu)
+        for name in spa_names:
+            if self._normalize(name) in msg_norm:
+                return name
+
+        # 3) fuzzy nhẹ
+        cand = get_close_matches(msg_norm, [self._normalize(s) for s in spa_names], n=1, cutoff=0.6)
+        if cand:
+            return next((s for s in spa_names if self._normalize(s) == cand[0]), None)
+
+        return None
 
     # ===== GPT =====
     def is_general_skin_question_gpt(self, message, client: OpenAI):

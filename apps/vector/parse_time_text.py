@@ -12,8 +12,12 @@ class ParseTimeText:
       - "12/08/2025 09:00", "12/8 lúc 9h", "12-8 14:30"
       - "2 giờ chiều nay", "9h kém 15 tối mai", "9 giờ rưỡi sáng thứ 6 tuần sau"
       - "thứ 3", "CN tuần sau", "ngày 5 lúc 14:00"
-      - "2pm/2 am", "9h30", "tối nay", "trưa mai"
+      - "2pm/2 am", "9h30", "tối nay", "trưa mai", "nửa đêm"
     Trả về datetime (naive, local) hoặc None nếu không bắt được.
+    Quy tắc quan trọng:
+      - Nếu người dùng nêu RÕ giờ số + buổi → ưu tiên chuyển đổi chính xác (vd: 6 giờ tối → 18:00).
+      - Chỉ dùng mặc định theo buổi (sáng=09:00, trưa=12:00, chiều=15:00, tối=19:00, đêm=22:00, khuya=23:30)
+        khi KHÔNG có số giờ.
     """
 
     # ---------- Public API ----------
@@ -105,10 +109,10 @@ class ParseTimeText:
             except Exception:
                 return None
 
-        # dd/mm (năm hiện tại) + hh[:mm]
+        # dd/mm (năm hiện tại) + hh[:mm] (tùy chọn 'nam yyyy')
         now = datetime.now()
         m = re.search(
-            r"\b(\d{1,2})[\/\-](\d{1,2})\b\s*(?:\b(?:nam|năm)\s+(\d{4}))?\s*(?:luc|l|vao luc|vao)?\s*(\d{1,2})(?::(\d{2}))?\b",
+            r"\b(\d{1,2})[\/\-](\d{1,2})\b\s*(?:\b(?:nam|nam)\s+(\d{4}))?\s*(?:luc|l|vao luc|vao)?\s*(\d{1,2})(?::(\d{2}))?\b",
             norm,
         )
         if m:
@@ -135,7 +139,7 @@ class ParseTimeText:
             d, mth = map(int, m.groups())
             return now.year, mth, d, True
 
-        # 'ngày/Ngay 12'
+        # 'ngày 12'
         norm = self._normalize(raw)
         m = re.search(r"\bngay\s+(\d{1,2})\b", norm)
         if m:
@@ -156,8 +160,8 @@ class ParseTimeText:
         if re.search(r"\bhom nay\b|\bnay\b", text_norm):
             return now.year, now.month, now.day, False
 
-        # ngày mai / mai
-        if re.search(r"\b(ngay )?mai\b", text_norm):
+        # ngày mai / mai / tomorrow
+        if re.search(r"\b(ngay )?mai\b|\btomorrow\b", text_norm):
             dt = now + timedelta(days=1)
             return dt.year, dt.month, dt.day, False
 
@@ -177,10 +181,12 @@ class ParseTimeText:
             "chu nhat": 6, "cn": 6,
         }
         week_offset = 0
-        if re.search(r"\btuan sau\b|\btuan toi\b", text_norm):
+        if re.search(r"\btuan sau\b|\btuan toi\b|\bnext week\b", text_norm):
             week_offset = 7
-        elif re.search(r"\btuan nay\b", text_norm):
+        elif re.search(r"\btuan nay\b|\bthis week\b", text_norm):
             week_offset = 0
+        elif re.search(r"\blast week\b|\btuan truoc\b", text_norm):
+            week_offset = -7
 
         for key, target_wd in wd_map.items():
             if re.search(rf"\b{key}\b", text_norm):
@@ -196,59 +202,114 @@ class ParseTimeText:
             dt = now + timedelta(days=1)
             return dt.year, dt.month, dt.day, False
 
+        # 'nua dem' → 00:00 hôm sau nếu không có giờ số (xử lý ở _parse_time)
         return None
+
+    def _apply_daypart(self, hour: int, minute: int, daypart: Optional[str]) -> Tuple[int, int, int]:
+        """
+        Áp dụng quy tắc theo buổi cho 'hour' đã có số.
+        Trả về (hour_24, minute, extra_day_offset)
+        """
+        extra = 0
+        if not daypart:
+            return hour, minute, extra
+
+        if daypart == "sang":   # 1..11 → giữ nguyên; 12am → 0; 12 → 0 nếu có 'am'
+            if hour == 12:
+                hour = 0
+            return hour, minute, extra
+
+        if daypart == "trua":   # nếu 1..3 trưa → 13..15; 12 → 12
+            if 1 <= hour <= 3:
+                hour += 12
+            elif hour == 12:
+                hour = 12
+            return hour, minute, extra
+
+        if daypart in ("chieu", "toi"):  # 1..11 → +12; 12 → 12 (nhưng 12 'toi' có thể hiểu 0h hôm sau → xử lý riêng)
+            if 1 <= hour <= 11:
+                hour += 12
+            elif hour == 12 and daypart == "toi":
+                # "12 giờ tối" → 00:00 hôm sau
+                hour = 0
+                extra = 1
+            return hour, minute, extra
+
+        if daypart in ("dem", "khuya"):
+            # 1..5 giờ đêm/khuya → rạng sáng hôm sau (01..05)
+            if 1 <= hour <= 5:
+                extra = 1  # hôm sau
+                # hour giữ nguyên 1..5
+            elif 6 <= hour <= 11:
+                hour += 12  # 18..23 hiếm nhưng chấp nhận
+            elif hour == 12:
+                # "12 giờ đêm"/"nửa đêm" = 00:00 hôm sau
+                hour = 0
+                extra = 1
+            return hour, minute, extra
+
+        return hour, minute, extra
 
     def _parse_time(self, raw: str, norm: str) -> Optional[Tuple[int, int, bool, bool]]:
         # am/pm flags
         am = bool(re.search(r"\bam\b", norm))
         pm = bool(re.search(r"\bpm\b", norm))
 
-        # buổi
+        # buổi (nhận cả "buoi toi", "buoi chieu")
         daypart = None
-        if re.search(r"\bsang\b", norm): daypart = "sang"
-        elif re.search(r"\btrua\b", norm): daypart = "trua"
-        elif re.search(r"\bchieu\b", norm): daypart = "chieu"
-        elif re.search(r"\btoi\b", norm): daypart = "toi"
-        elif re.search(r"\bdem\b", norm): daypart = "dem"
-        elif re.search(r"\bkhuya\b", norm): daypart = "khuya"
+        if re.search(r"\b(buoi\s+)?sang\b", norm):  daypart = "sang"
+        elif re.search(r"\b(buoi\s+)?trua\b", norm): daypart = "trua"
+        elif re.search(r"\b(buoi\s+)?chieu\b", norm): daypart = "chieu"
+        elif re.search(r"\b(buoi\s+)?toi\b", norm):   daypart = "toi"
+        elif re.search(r"\b(ban\s+)?dem\b", norm):    daypart = "dem"
+        elif re.search(r"\bkhuya\b", norm):           daypart = "khuya"
+        elif re.search(r"\bnua dem\b|\bnua\sdem\b", norm): daypart = "dem"  # nửa đêm
 
-        # hh:mm
+        # --- ƯU TIÊN GIỜ SỐ (có thể kèm phút) ---
+        # hh:mm (dùng 'raw' để giữ dấu ':')
         m = re.search(r"\b(\d{1,2}):(\d{2})\b", raw)
         if m:
             h, mnt = map(int, m.groups())
+            # am/pm
             if pm and 1 <= h <= 11: h += 12
             if am and h == 12: h = 0
-            if daypart in ("trua", "chieu", "toi", "dem", "khuya") and h < 12:
-                h += 12
+            # buổi
+            h, mnt, extra = self._apply_daypart(h, mnt, daypart)
+            # clamp
+            h = max(0, min(h, 23)); mnt = max(0, min(mnt, 59))
             return h, mnt, True, bool(daypart)
 
         # 9h30 / 9g30 / 9 gio 30
-        m = re.search(r"\b(\d{1,2})\s*(?:h|g|gio|giờ)\s*(\d{1,2})\b", norm)
+        m = re.search(r"\b(\d{1,2})\s*(?:h|g|gio|gio|gi\u1edd)\s*(\d{1,2})\b", norm)
         if m:
             h, mnt = map(int, m.groups())
             if pm and 1 <= h <= 11: h += 12
             if am and h == 12: h = 0
-            if daypart in ("trua", "chieu", "toi", "dem", "khuya") and h < 12:
-                h += 12
+            h, mnt, extra = self._apply_daypart(h, mnt, daypart)
+            h = max(0, min(h, 23)); mnt = max(0, min(mnt, 59))
             return h, mnt, True, bool(daypart)
 
-        # 9h / 9 giờ
-        m = re.search(r"\b(\d{1,2})\s*(?:h|g|gio|giờ)\b", norm)
+        # 9h / 9 giờ (+ 'kém' / 'rưỡi')
+        m = re.search(r"\b(\d{1,2})\s*(?:h|g|gio|gio|gi\u1edd)\b", norm)
         if m:
             h = int(m.group(1)); mnt = 0
             # 'kém 15'
             m2 = re.search(r"\bkem\s+(\d{1,2})\b", norm)
             if m2:
                 minus = int(m2.group(1))
-                mnt = (60 - minus) % 60
-                h = (h - 1) if minus > 0 else h
+                if minus > 0:
+                    total = h * 60 - minus
+                    if total < 0:
+                        total += 24 * 60
+                    h, mnt = divmod(total, 60)
             # 'rưỡi'
-            if re.search(r"\br\w*?i\b", norm):  # ruoi/rưởi
+            if re.search(r"\bruoi\b", norm):
                 mnt = 30
+
             if pm and 1 <= h <= 11: h += 12
             if am and h == 12: h = 0
-            if daypart in ("trua", "chieu", "toi", "dem", "khuya") and h < 12:
-                h += 12
+            h, mnt, extra = self._apply_daypart(h, mnt, daypart)
+            h = max(0, min(h, 23)); mnt = max(0, min(mnt, 59))
             return h, mnt, True, bool(daypart)
 
         # 2 pm / 2 a.m.
@@ -264,9 +325,11 @@ class ParseTimeText:
             if h == 12: h = 0
             return h, 0, True, False
 
-        # chỉ buổi
+        # chỉ buổi (KHÔNG có số giờ) → dùng mặc định
         if daypart:
             defaults = {"sang": 9, "trua": 12, "chieu": 15, "toi": 19, "dem": 22, "khuya": 23}
-            return defaults[daypart], (30 if daypart == "khuya" else 0), False, True
+            h = defaults[daypart]
+            mnt = 30 if daypart == "khuya" else 0
+            return h, mnt, False, True
 
         return None

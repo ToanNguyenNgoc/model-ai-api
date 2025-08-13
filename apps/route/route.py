@@ -8,6 +8,8 @@ from apps.dto.media_dto import MediaDto
 from apps.controllers import media_controller
 from apps.dto.organization_dto import OrganizationDto
 from apps.controllers import org_controller
+from apps.dto.ai_dto import AIDto
+from apps.controllers import ai_controller
 
 class Route:
     def __init__(self, api):
@@ -18,6 +20,7 @@ class Route:
         self.api.add_namespace(UserDto.api, path='/api/users')
         self.api.add_namespace(OrganizationDto.api, path='/api/organizations')
         self.api.add_namespace(BotDto.api, path='/api/bots')
+        self.api.add_namespace(AIDto.api, path='/api/ai')
         self.api.add_namespace(MediaDto.api, path='/api/media')
         
         return
