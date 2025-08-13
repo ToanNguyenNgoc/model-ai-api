@@ -340,14 +340,14 @@ class TrainingVector(BaseController):
         return self.finalize_reply("\n".join(reply), conversation_key, history)
 
     def parse_datetime_from_message(self, message):
-        # return self.dt_parser.parse(message)
-        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})", message.strip())
-        if not m: return None
-        try:
-            dd, mm, yyyy, HH, MM = map(int, m.groups())
-            return datetime(yyyy, mm, dd, HH, MM, 0)
-        except Exception:
-            return None
+        return self.dt_parser.parse(message)
+        # m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})", message.strip())
+        # if not m: return None
+        # try:
+        #     dd, mm, yyyy, HH, MM = map(int, m.groups())
+        #     return datetime(yyyy, mm, dd, HH, MM, 0)
+        # except Exception:
+        #     return None
 
     def handle_booking_details(self, ctx, message):
         msg = message.strip()

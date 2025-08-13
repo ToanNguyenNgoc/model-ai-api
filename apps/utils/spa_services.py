@@ -1,9 +1,10 @@
 spa_services = {
-            "Spa Lily": [
+            "Spa Serenity": [
                 {"name": "Massage toàn thân", "description": "Thư giãn với tinh dầu thiên nhiên trong 60 phút"},
-                {"name": "Chăm sóc da mặt", "description": "Làm sạch sâu, cấp ẩm, chống lão hóa"}
+                {"name": "Chăm sóc da mặt", "description": "Làm sạch sâu, cấp ẩm, chống lão hóa"},
+                {"name": "Liệu trình massage đá nóng", "description": "Liệu trình massage đá nóng là phương pháp sử dụng đá bazan nóng (thường ở nhiệt độ 50-65°C) kết hợp với các động tác xoa bóp, day ấn để thư giãn cơ thể, giảm căng thẳng và đau nhức"},
             ],
-            "Thẩm mỹ viện Hoa Mai": [
+            "Thẩm mỹ viện PMT": [
                 {"name": "Tắm trắng phi thuyền", "description": "Làm sáng da bằng công nghệ ánh sáng"},
                 {"name": "Trị mụn chuyên sâu", "description": "Chiết mụn, xông hơi, kháng viêm"}
             ],
@@ -25,5 +26,4 @@ spa_services = {
                     "description":"Phục hồi và cải thiện tổng thể cấu trúc da: Sự kết hợp của IPL, Aqua Hydra và các bước chăm sóc chuyên sâu trong quy trình ACNE PRO",
                 }
             ]
-
         }
