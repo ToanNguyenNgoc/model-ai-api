@@ -34,10 +34,9 @@ class TrainingVector(BaseController):
 
     # ===== Normalize / utils =====
     def _normalize(self, s: str) -> str:
-        s = (s or "").casefold().strip()  # casefold tốt cho unicode hơn lower()
+        s = (s or "").casefold().strip()
         s = unicodedata.normalize("NFD", s)
         s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-        # dynamic fold: LATIN ... LETTER X WITH ... -> x
         def fold_char(ch: str) -> str:
             if ch.isascii():
                 return ch
@@ -47,7 +46,7 @@ class TrainingVector(BaseController):
                 for c in base:
                     if c.isalpha():
                         return c.lower()
-            if ch in ("đ", "Đ"):  # fallback an toàn
+            if ch in ("đ", "Đ"):
                 return "d"
             return ch
         s = "".join(fold_char(ch) for ch in s)
@@ -79,7 +78,6 @@ class TrainingVector(BaseController):
 
     # ===== Spa / Service detection =====
     def detect_spa_in_message(self, message, spa_names):
-        """Bắt tên spa kể cả 'spa + tên' hoặc 'tên + spa' (không dấu)."""
         msg_norm = self._normalize(message)
         for name in spa_names:
             name_norm = self._normalize(name)
@@ -93,7 +91,6 @@ class TrainingVector(BaseController):
         return None
 
     def find_exact_service_by_name(self, message, spa_services_dict):
-        """Chỉ dùng khi KHÔNG booking."""
         msg = self._normalize(message)
         for spa_name, services in spa_services_dict.items():
             for s in services:
@@ -118,17 +115,24 @@ class TrainingVector(BaseController):
         ]
         return any(re.search(p, msg) for p in patterns)
 
+    def is_additional_booking(self, message: str) -> bool:
+        """Nhận diện 'đặt hẹn thêm' để reset context cũ trước khi vào flow mới."""
+        msg = self._normalize(message)
+        keys = ["dat hen them", "dat them", "dat lich them", "them mot lich", "them lich"]
+        return any(k in msg for k in keys)
+
     def is_booking_request(self, message):
         msg = self._normalize(message)
         keywords = [
             "dat lich", "dat hen", "booking", "book", "dat ngay",
             "muon hen", "muon dat", "hen lich", "dat lich hen",
-            "dat slot", "giu cho", "giup minh dat", "dang ky lich"
+            "dat slot", "giu cho", "giup minh dat", "dang ky lich",
+            # coi 'đặt thêm' cũng là booking
+            "dat hen them", "dat them", "dat lich them", "them mot lich", "them lich"
         ]
         return any(k in msg for k in keywords)
 
     def is_request_for_service_list(self, message):
-        """KHÔNG coi là hỏi danh sách dịch vụ nếu có ý định đặt hẹn."""
         if self.is_booking_request(message):
             return False
         msg = self._normalize(message)
@@ -145,7 +149,6 @@ class TrainingVector(BaseController):
         return any(re.search(p, msg) for p in pats)
 
     def infer_service_from_history(self, history):
-        """Tìm dịch vụ được nhắc gần nhất trong history."""
         for h in reversed(history):
             content = h.get("content", "").lower()
             for spa_name, services in spa_services.items():
@@ -162,6 +165,20 @@ class TrainingVector(BaseController):
     def get_last_spa_list(self, conversation_key):
         return cache.get(f"{conversation_key}:last_spa_list") or []
 
+    def reply_choose_spa_from_last_list(self, conversation_key, history, note=None):
+        spa_list = self.get_last_spa_list(conversation_key)
+        if not spa_list:
+            return self.finalize_reply("Bạn cho mình xin **tên spa** muốn xem dịch vụ nhé.", conversation_key, history)
+        lines = []
+        header = "Bạn muốn xem dịch vụ của **spa nào** dưới đây:"
+        if note:
+            header += f" ({note})"
+        lines.append(header)
+        for i, item in enumerate(spa_list, 1):
+            lines.append(f"{i}. **{item['name']}** — {item['address']}")
+        lines.append("Vui lòng trả lời **số thứ tự** hoặc **tên spa**.")
+        return self.finalize_reply("\n".join(lines), conversation_key, history)
+
     def resolve_spa_selection_from_message(self, message, spa_list):
         msg = message.strip().lower()
         m = re.match(r"^\s*(\d{1,2})\s*$", msg)
@@ -175,24 +192,16 @@ class TrainingVector(BaseController):
         return None
 
     def resolve_service_selection_from_message(self, message, candidates):
-        """
-        Trả về tên dịch vụ đã chọn từ 'candidates' dựa trên input (số thứ tự hoặc tên).
-        """
         msg = self._normalize(message)
-        # số thứ tự
         m = re.match(r"^\s*(\d{1,2})\s*$", msg)
         if m:
             idx = int(m.group(1)) - 1
             if 0 <= idx < len(candidates):
                 return candidates[idx]
-
-        # chứa nguyên cụm
         norm_cands = [self._normalize(c) for c in candidates]
         for i, nc in enumerate(norm_cands):
             if nc in msg:
                 return candidates[i]
-
-        # overlap token
         best_i, best_score = -1, 0
         for i, nc in enumerate(norm_cands):
             toks = [t for t in nc.split() if len(t) >= 2]
@@ -201,8 +210,6 @@ class TrainingVector(BaseController):
                 best_score, best_i = score, i
         if best_score > 0:
             return candidates[best_i]
-
-        # fuzzy
         match = get_close_matches(msg, norm_cands, n=1, cutoff=0.6)
         if match:
             i = norm_cands.index(match[0])
@@ -211,7 +218,6 @@ class TrainingVector(BaseController):
 
     # ===== Finders =====
     def find_spas_by_city(self, spas, city):
-        """Tìm spa theo thành phố (khớp mềm, bỏ dấu)."""
         city_norm = self._normalize(city)
         results = []
         for spa in spas:
@@ -254,7 +260,6 @@ class TrainingVector(BaseController):
         return self.finalize_reply(f"Chưa có thông tin chi tiết về **{spa_name}**.", conversation_key, history)
 
     def reply_service_list(self, spa_name, services_dict, conversation_key, history):
-        """Lưu 'spa đang xem' để user nói 'đặt hẹn ...' không cần nhắc lại spa."""
         services = services_dict.get(spa_name, [])
         if not services:
             return self.finalize_reply(f"Hiện **{spa_name}** chưa cập nhật dịch vụ.", conversation_key, history)
@@ -275,7 +280,7 @@ class TrainingVector(BaseController):
         reply = ["Bạn muốn đặt **dịch vụ** nào sau đây:"]
         for i, name in enumerate(service_names, 1):
             reply.append(f"{i}. {name}")
-        reply.append("Vui lòng trả lời số thứ tự hoặc tên dịch vụ.")
+        reply.append("Vui lòng trả lời **số thứ tự** hoặc **tên dịch vụ**.")
         return self.finalize_reply("\n".join(reply), conversation_key, history)
 
     def reply_choose_spa_for_service(self, service_name, spas, conversation_key, history, slot_label=None):
@@ -290,7 +295,6 @@ class TrainingVector(BaseController):
 
     # ===== Booking flow helpers =====
     def find_services_in_text(self, message, services_dict):
-        """Bắt dịch vụ 'gần đúng' để phục vụ booking."""
         msg = self._normalize(message)
         found, all_names = [], set()
         for spa_name, services in services_dict.items():
@@ -352,7 +356,7 @@ class TrainingVector(BaseController):
     def handle_booking_details(self, ctx, message):
         msg = message.strip()
 
-        # Time
+        # Time (giữ nguyên nhánh này cho bước hỏi/confirm; 4.b ở controller đã override nếu user nói kèm giờ)
         if not ctx.get("slot"):
             desired_dt = self.parse_datetime_from_message(msg)
             if desired_dt:
@@ -365,30 +369,28 @@ class TrainingVector(BaseController):
                         ctx["slot"] = ctx["available_slots"][idx]
                 if not ctx.get("slot"):
                     return False, ctx, "Mình chưa bắt được thời gian. Bạn chọn số thứ tự hoặc nhập **dd/mm/yyyy hh:mm** nhé."
-
         # Name
-        if not ctx.get("customer_name"):
-            if not re.search(r"\d", msg) and len(msg) >= 2 and msg.lower() not in ["ok", "oke", "yes"]:
-                ctx["customer_name"] = msg
-            if not ctx.get("customer_name"):
-                return False, ctx, "Cho mình xin **tên** của bạn để giữ chỗ nhé."
+        # if not ctx.get("customer_name"):
+        #     if not re.search(r"\d", msg) and len(msg) >= 2 and msg.lower() not in ["ok", "oke", "yes"]:
+        #         ctx["customer_name"] = msg
+        #     if not ctx.get("customer_name"):
+        #         return False, ctx, "Cho mình xin **tên** của bạn để giữ chỗ nhé."
 
         # Phone
-        if not ctx.get("phone"):
-            phone_match = re.search(r"(0\d{9,10}|84\d{9,10}|\+84\d{9,10})", msg.replace(" ", ""))
-            if phone_match:
-                ctx["phone"] = phone_match.group(1)
-            if not ctx.get("phone"):
-                return False, ctx, "Bạn vui lòng cho mình xin **số điện thoại** (ví dụ: 09xxxxxxxx)."
-
+        # if not ctx.get("phone"):
+        #     phone_match = re.search(r"(0\d{9,10}|84\d{9,10}|\+84\d{9,10})", msg.replace(" ", ""))
+        #     if phone_match:
+        #         ctx["phone"] = phone_match.group(1)
+        #     if not ctx.get("phone"):
+        #         return False, ctx, "Bạn vui lòng cho mình xin **số điện thoại** (ví dụ: 09xxxxxxxx)."
         # Confirm
         confirm_text = (
             "Xác nhận đặt hẹn:\n"
             f"- Spa: {ctx['spa_name']}\n"
             f"- Dịch vụ: {ctx['service_name']}\n"
             f"- Thời gian: {ctx['slot']['label']}\n"
-            f"- Khách hàng: {ctx['customer_name']}\n"
-            f"- SĐT: {ctx['phone']}\n\n"
+            # f"- Khách hàng: {ctx['customer_name']}\n"
+            # f"- SĐT: {ctx['phone']}\n\n"
             "Bạn xác nhận **ĐỒNG Ý** chứ?"
         )
         if any(kw in msg.lower() for kw in ["đồng ý", "dong y", "xac nhan", "xác nhận", "confirm"]):
@@ -403,10 +405,9 @@ class TrainingVector(BaseController):
             f"- Spa: {ctx['spa_name']}\n"
             f"- Dịch vụ: {ctx['service_name']}\n"
             f"- Thời gian: {ctx['slot']['label']}\n"
-            f"- Khách hàng: {ctx['customer_name']} — {ctx['phone']}\n"
             "Hẹn gặp bạn tại spa!"
         )
-    
+
     # === Appointment ===
     def is_request_for_my_appointments(self, message: str) -> bool:
         msg = self._normalize(message)
@@ -418,9 +419,6 @@ class TrainingVector(BaseController):
         return any(k in msg for k in keys)
 
     def add_appointment(self, user_id: str, ctx: dict):
-        """
-        Lưu lịch hẹn sau khi user xác nhận. Mỗi lịch có id đơn giản theo timestamp.
-        """
         appt_key = f"appointments:{user_id}"
         appts = cache.get(appt_key) or []
         appt_id = f"APPT-{int(datetime.now().timestamp())}"
@@ -430,11 +428,11 @@ class TrainingVector(BaseController):
             "service_name": ctx.get("service_name"),
             "slot_label": ctx.get("slot", {}).get("label"),
             "slot_iso": ctx.get("slot", {}).get("iso"),
-            "customer_name": ctx.get("customer_name"),
-            "phone": ctx.get("phone"),
+            # "customer_name": ctx.get("customer_name"),
+            # "phone": ctx.get("phone"),
             "created_at": datetime.now().isoformat()
         })
-        cache.set(appt_key, appts, timeout=30 * 24 * 3600)  # giữ 30 ngày
+        cache.set(appt_key, appts, timeout=30 * 24 * 3600)
         return appt_id
 
     def get_appointments(self, user_id: str):
@@ -445,7 +443,6 @@ class TrainingVector(BaseController):
         if not appts:
             return self.finalize_reply("Hiện bạn **chưa có lịch hẹn** nào trong hệ thống.", conversation_key, history)
 
-        # sắp xếp theo thời gian (nếu có slot_iso)
         def key_func(a):
             try:
                 return datetime.fromisoformat(a.get("slot_iso"))
@@ -457,8 +454,8 @@ class TrainingVector(BaseController):
         lines = ["📒 **Lịch hẹn của bạn:**"]
         for i, a in enumerate(appts_sorted, 1):
             lines.append(
-                f"{i}. {a.get('slot_label','(chưa rõ)')} — **{a.get('spa_name','?')}** / {a.get('service_name','?')} "
-                f"(SĐT: {a.get('phone','?')})\n   Mã lịch hẹn: `{a.get('id')}`"
+                f"{i}. {a.get('slot_label','(chưa rõ)')} — **{a.get('spa_name','?')}** / {a.get('service_name','?')}\n"
+                f"   Mã lịch hẹn: `{a.get('id')}`"
             )
         return self.finalize_reply("\n".join(lines), conversation_key, history)
 
