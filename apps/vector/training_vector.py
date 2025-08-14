@@ -33,6 +33,12 @@ class TrainingVector(BaseController):
     def clear_booking_context(self, user_id):
         cache.delete(f"booking:{user_id}")
 
+    def reset_time_fields(self, ctx: dict) -> dict:
+        """Xoá sạch thông tin thời gian để tránh dính slot cũ."""
+        for k in ("slot", "available_slots", "confirmed"):
+            ctx.pop(k, None)
+        return ctx
+
     # ===== Normalize / utils =====
     def _normalize(self, s: str) -> str:
         s = (s or "").casefold().strip()
