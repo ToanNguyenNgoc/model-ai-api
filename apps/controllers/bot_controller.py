@@ -103,7 +103,6 @@ class GetMessageV2(BaseController):
         return self.json_response({"message": "Conversation history deleted."})
 
 @BotDto.api.route('/messages/v2')
-
 class MessageV2(BaseController, Resource):
     @BotDto.api.expect(BotDto.post_message, validate=True)
     def post(self):
@@ -137,8 +136,7 @@ class MessageV2(BaseController, Resource):
                 s, e, title = parsed
                 return helper.reply_my_appointments_in_range(user_id, s, e, title, conversation_key, history)
 
-        # ===== 1) Skincare chung (đặt sớm để không bị lấn bởi “danh sách dịch vụ”) =====
-        # (is_skin_question_local là heuristic nội bộ; nếu không có vẫn dùng GPT filter)
+        # ===== 1) Skincare chung (ưu tiên sớm) =====
         is_skin = getattr(helper, "is_skin_question_local", lambda _m: False)(message)
         if is_skin or helper.is_general_skin_question_gpt(message, client):
             if ctx.get("active"):
@@ -161,7 +159,7 @@ class MessageV2(BaseController, Resource):
         # ===== 4) Danh sách dịch vụ (LUÔN clear booking context để không dính giờ cũ) =====
         if helper.is_request_for_service_list(message):
             target_spa = spa_name or ctx.get("spa_name") or cache.get(f"{conversation_key}:last_spa_focus")
-            helper.clear_booking_context(user_id)  # quan trọng: reset slot/confirmed/...
+            helper.clear_booking_context(user_id)  # reset slot/confirmed/...
             if target_spa:
                 return helper.reply_service_list(target_spa, spa_services, conversation_key, history)
 
@@ -224,7 +222,7 @@ class MessageV2(BaseController, Resource):
                             helper.set_booking_context(user_id, {**ctx, "active": True})
                             return helper.reply_choose_service(unique, conversation_key, history)
 
-            # 5.b2 — xác định SPA (từ message > last_spa_focus > theo dịch vụ)
+            # 5.b2 — XÁC ĐỊNH SPA (từ message > last_spa_focus > theo dịch vụ)
             if not ctx.get("spa_name"):
                 spa_from_msg = spa_name or helper.detect_spa_in_message(message, spa_names)
                 if spa_from_msg:
@@ -259,11 +257,16 @@ class MessageV2(BaseController, Resource):
                         )
 
             # 5.b3 — Nếu đã biết SPA mà CHƯA có dịch vụ → hỏi chọn dịch vụ của spa đó
+            # (ƯU TIÊN BẮT DỊCH VỤ TRONG PHẠM VI SPA TRƯỚC)
             if ctx.get("spa_name") and not ctx.get("service_name"):
-                service_list = [s["name"] for s in spa_services.get(ctx["spa_name"], [])]
-                ctx["service_candidates"] = service_list
-                helper.set_booking_context(user_id, {**ctx, "active": True})
-                return helper.reply_choose_service_for_spa(ctx["spa_name"], service_list, conversation_key, history)
+                picked_in_spa = getattr(helper, "find_service_in_text_for_spa", lambda *_: None)(message, ctx["spa_name"])
+                if picked_in_spa:
+                    ctx["service_name"] = picked_in_spa
+                else:
+                    service_list = [s["name"] for s in spa_services.get(ctx["spa_name"], [])]
+                    ctx["service_candidates"] = service_list
+                    helper.set_booking_context(user_id, {**ctx, "active": True})
+                    return helper.reply_choose_service_for_spa(ctx["spa_name"], service_list, conversation_key, history)
 
             # 5.c — Nếu CHƯA có slot → gợi ý slot
             if not ctx.get("slot"):
@@ -278,7 +281,7 @@ class MessageV2(BaseController, Resource):
             if not filled:
                 return helper.finalize_reply(ask, conversation_key, history)
 
-            # 5.e — Lưu + clean context cũ
+            # 5.e — Lưu + clean context cũ (sạch hoàn toàn slot/flags cho lần đặt mới)
             confirmation = helper.confirm_booking(ctx)
             helper.add_appointment(user_id, ctx)
             helper.clear_booking_context(user_id)

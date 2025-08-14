@@ -294,6 +294,42 @@ class TrainingVector(BaseController):
                     spas.append(spa)
                     break
         return spas
+    
+    def find_service_in_text_for_spa(self, message: str, spa_name: str):
+        """
+        Ưu tiên bắt dịch vụ CHỈ trong phạm vi spa_name (focus đúng spa).
+        Trả về tên dịch vụ (str) hoặc None nếu không nhận được.
+        """
+        msg = self._normalize(message)
+        services = spa_services.get(spa_name, [])
+        if not services:
+            return None
+
+        # (a) khớp nguyên cụm
+        for s in services:
+            if self._normalize(s["name"]) in msg:
+                return s["name"]
+
+        # (b) chấm điểm theo overlap token (>=2 token là đạt)
+        best_name, best_score = None, 0
+        for s in services:
+            name_norm = self._normalize(s["name"])
+            toks = [t for t in name_norm.split() if len(t) >= 2]
+            score = sum(1 for t in toks if t in msg)
+            if score > best_score:
+                best_score, best_name = score, s["name"]
+        if best_score >= 2:
+            return best_name
+
+        # (c) fuzzy nhẹ
+        from difflib import get_close_matches
+        names_norm = [self._normalize(s["name"]) for s in services]
+        match = get_close_matches(msg, names_norm, n=1, cutoff=0.6)
+        if match:
+            idx = names_norm.index(match[0])
+            return services[idx]["name"]
+
+        return None
 
     # ===== Replies =====
     def reply_spa_list(self, city, matched_spas, conversation_key, history):
@@ -409,14 +445,58 @@ class TrainingVector(BaseController):
         # except Exception:
         #     return None
 
+    # --- BỔ SUNG: nhận diện đổi giờ ---
+    def is_change_time_request(self, message: str) -> bool:
+        msg = self._normalize(message)
+        keys = [
+            "doi gio", "doi thoi gian", "doi lich", "sua gio", "chinh gio",
+            "chuyen sang", "doi sang", "doi qua", "reschedule", "change time",
+            "doi thoi diem", "doi khung gio", "doi slot", "doi gio hen"
+        ]
+        return any(k in msg for k in keys)
+
     def handle_booking_details(self, ctx, message):
         msg = message.strip()
 
-        # Time (giữ nguyên nhánh này cho bước hỏi/confirm; 4.b ở controller đã override nếu user nói kèm giờ)
+        # Nếu đã có slot và người dùng nói đổi giờ hoặc nhập giờ mới → cập nhật trước
+        already_has_slot = bool(ctx.get("slot"))
+        wants_change_time = getattr(self, "is_change_time_request", lambda _m: False)(msg)
+        parsed_new_dt = self.parse_datetime_from_message(msg)
+
+        if already_has_slot and (wants_change_time or parsed_new_dt):
+            if parsed_new_dt:
+                prev_label = ctx["slot"]["label"]
+                ctx["previous_slot"] = ctx["slot"]
+                ctx["slot"] = {"label": parsed_new_dt.strftime("%d/%m/%Y %H:%M"),
+                            "iso": parsed_new_dt.isoformat()}
+                ctx.pop("available_slots", None)
+                ctx.pop("confirmed", None)
+                ask = (
+                    "⏰ Đã cập nhật **thời gian** đặt hẹn:\n"
+                    f"- Trước đó: {prev_label}\n"
+                    f"- Mới: {ctx['slot']['label']}\n\n"
+                    "Bạn xác nhận **ĐỒNG Ý** chứ?"
+                )
+                return False, ctx, ask
+            else:
+                # muốn đổi nhưng chưa nêu giờ → gợi ý slot
+                if ctx.get("spa_name"):
+                    slots = self.get_available_slots(ctx["spa_name"])
+                    ctx["available_slots"] = slots
+                    ask = ["Bạn muốn đổi sang **thời gian** nào? Lịch trống gần nhất:"]
+                    for i, s in enumerate(slots[:8], 1):
+                        ask.append(f"{i}. {s['label']}")
+                    ask.append("Vui lòng **chọn số** hoặc nhập **dd/mm/yyyy hh:mm**.")
+                    return False, ctx, "\n".join(ask)
+                else:
+                    return False, ctx, "Bạn muốn đổi sang **thời gian nào**? (định dạng **dd/mm/yyyy hh:mm**)."
+
+        # Nếu CHƯA có slot → bắt thời gian
         if not ctx.get("slot"):
             desired_dt = self.parse_datetime_from_message(msg)
             if desired_dt:
-                ctx["slot"] = {"label": desired_dt.strftime("%d/%m/%Y %H:%M"), "iso": desired_dt.isoformat()}
+                ctx["slot"] = {"label": desired_dt.strftime("%d/%m/%Y %H:%M"),
+                            "iso": desired_dt.isoformat()}
             else:
                 m = re.match(r"^\s*(\d{1,2})\s*$", msg)
                 if m and ctx.get("available_slots"):
@@ -424,29 +504,14 @@ class TrainingVector(BaseController):
                     if 0 <= idx < len(ctx["available_slots"]):
                         ctx["slot"] = ctx["available_slots"][idx]
                 if not ctx.get("slot"):
-                    return False, ctx, "Mình chưa bắt được thời gian. Bạn chọn số thứ tự hoặc nhập **dd/mm/yyyy hh:mm** nhé."
-        # Name
-        # if not ctx.get("customer_name"):
-        #     if not re.search(r"\d", msg) and len(msg) >= 2 and msg.lower() not in ["ok", "oke", "yes"]:
-        #         ctx["customer_name"] = msg
-        #     if not ctx.get("customer_name"):
-        #         return False, ctx, "Cho mình xin **tên** của bạn để giữ chỗ nhé."
+                    return False, ctx, "Mình chưa bắt được thời gian. Bạn chọn **số thứ tự** hoặc nhập **dd/mm/yyyy hh:mm** nhé."
 
-        # Phone
-        # if not ctx.get("phone"):
-        #     phone_match = re.search(r"(0\d{9,10}|84\d{9,10}|\+84\d{9,10})", msg.replace(" ", ""))
-        #     if phone_match:
-        #         ctx["phone"] = phone_match.group(1)
-        #     if not ctx.get("phone"):
-        #         return False, ctx, "Bạn vui lòng cho mình xin **số điện thoại** (ví dụ: 09xxxxxxxx)."
-        # Confirm
+        # Xác nhận (KHÔNG hỏi tên / SĐT)
         confirm_text = (
             "Xác nhận đặt hẹn:\n"
             f"- Spa: {ctx['spa_name']}\n"
             f"- Dịch vụ: {ctx['service_name']}\n"
             f"- Thời gian: {ctx['slot']['label']}\n"
-            # f"- Khách hàng: {ctx['customer_name']}\n"
-            # f"- SĐT: {ctx['phone']}\n\n"
             "Bạn xác nhận **ĐỒNG Ý** chứ?"
         )
         if any(kw in msg.lower() for kw in ["đồng ý", "dong y", "xac nhan", "xác nhận", "confirm"]):
@@ -698,6 +763,79 @@ class TrainingVector(BaseController):
 
         # Không nhận ra
         return None
+    
+    def has_time_expression(self, message: str) -> bool:
+        """
+        Trả về True nếu turn hiện tại có bất kỳ diễn đạt thời gian nào.
+        Dùng để quyết định có xoá slot cũ hay không.
+        """
+        raw = (message or "")
+        norm = self._normalize(raw)
+
+        # 1) Có parse được ngày/giờ rõ ràng -> có thời gian
+        try_dt = self.parse_datetime_from_message(raw)
+        if try_dt:
+            return True
+
+        # 2) Từ khoá thời gian thường gặp (không đủ để parse nhưng là tín hiệu user đang nói về giờ/ngày)
+        time_keywords = [
+            # buổi
+            "sang", "trua", "chieu", "toi", "dem", "khuya",
+            # chỉ ngày
+            "hom nay", "ngay mai", "hom qua", "tuan nay", "tuan sau", "tuan truoc",
+            "thang nay", "thang sau", "thang truoc",
+            # am/pm
+            " am", " pm",
+            # cấu trúc giờ tiếng Việt
+            " gio", " gio ", " gio.", " gio,", "g", "h", "kem", "ruoi", "rưỡi",
+            # định dạng số giờ
+            ":",  # 09:00
+        ]
+        if any(k in f" {norm} " for k in time_keywords):
+            return True
+
+        # 3) Mẫu số đơn giản: "9h", "9 g", "9 gio", "9 giờ"
+        if re.search(r"\b\d{1,2}\s*(h|g|gio|giờ)\b", norm):
+            return True
+
+        return False
+
+    def is_confirm_message(self, message: str) -> bool:
+        msg = self._normalize(message)
+        return any(k in msg for k in ["dong y", "xac nhan", "confirm", "ok", "oke", "okie"])
+
+    def find_service_in_text_for_spa(self, message: str, spa_name: str):
+        """
+        Match dịch vụ **trong phạm vi 1 spa cụ thể**.
+        """
+        msg = self._normalize(message)
+        services = [s["name"] for s in spa_services.get(spa_name, [])]
+        norm_map = {self._normalize(n): n for n in services}
+        # khớp full cụm
+        for norm_name, original in norm_map.items():
+            if norm_name in msg:
+                return original
+        # khớp overlap đơn giản
+        best, score = None, 0
+        for norm_name, original in norm_map.items():
+            toks = [t for t in norm_name.split() if len(t) >= 2]
+            sc = sum(1 for t in toks if t in msg)
+            if sc > score:
+                score, best = sc, original
+        return best if score > 0 else None
+
+    def infer_service_from_history(self, history):
+        """
+        Fallback: tìm dịch vụ + spa được nhắc gần nhất trong history khi người dùng nói 'dịch vụ này'.
+        """
+        for h in reversed(history):
+            content = self._normalize(h.get("content", ""))
+            for spa_name, services in spa_services.items():
+                for s in services:
+                    if self._normalize(s["name"]) in content:
+                        return {"spa_name": spa_name, "service_name": s["name"]}
+        return None
+    #...
 
     def reply_my_appointments_in_range(self, user_id: str, start: datetime, end: datetime, title: str, conversation_key: str, history: list):
         appts = self.get_appointments(user_id)
