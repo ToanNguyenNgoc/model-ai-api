@@ -117,19 +117,15 @@ class MessageV2(BaseController, Resource):
 
         helper = TrainingVector()
         client = OpenAI(api_key=os.getenv("A_SECRET_KEY"))
-        ctx = helper.get_booking_context(user_id)  # {active, spa_name, service_name, slot, ...}
+        ctx = helper.get_booking_context(user_id) or {"active": False}
 
-        # Nếu đang booking mà hỏi DS spa theo vị trí → dừng booking
+        # ===== Guard: chuyển sang flow khác → dừng booking đang treo =====
         if helper.is_request_for_spa_list(message) and ctx.get("active"):
-            helper.clear_booking_context(user_id)
-            ctx = {"active": False}
-
-        # Nếu user nói "đặt hẹn thêm ..." → reset context cũ trước khi vào flow mới
+            helper.clear_booking_context(user_id); ctx = {"active": False}
         if hasattr(helper, "is_additional_booking") and helper.is_additional_booking(message):
-            helper.clear_booking_context(user_id)
-            ctx = {"active": False}
+            helper.clear_booking_context(user_id); ctx = {"active": False}
 
-        # ===== 0) Tra cứu lịch hẹn theo khoảng thời gian (hôm nay/ngày mai/tuần này...) =====
+        # ===== 0) Tra cứu lịch hẹn theo khoảng thời gian =====
         if helper.is_appointments_lookup_intent(message):
             parsed = helper.parse_appointment_range(message)
             if parsed:
@@ -137,151 +133,128 @@ class MessageV2(BaseController, Resource):
                 return helper.reply_my_appointments_in_range(user_id, s, e, title, conversation_key, history)
 
         # ===== 1) Skincare chung (ưu tiên sớm) =====
-        is_skin = getattr(helper, "is_skin_question_local", lambda _m: False)(message)
-        if is_skin or helper.is_general_skin_question_gpt(message, client):
-            if ctx.get("active"):
-                helper.clear_booking_context(user_id)
+        if getattr(helper, "is_skin_question_local", lambda _m: False)(message) or helper.is_general_skin_question_gpt(message, client):
+            if ctx.get("active"): helper.clear_booking_context(user_id)
             return helper.reply_with_gpt_history(client, history, message, user_id)
 
         # ===== 2) Danh sách spa theo vị trí =====
-        city_keywords = helper.extract_city_keywords(spa_locations)
-        city = helper.extract_city_from_message(message, city_keywords)
+        city = helper.extract_city_from_message(message, helper.extract_city_keywords(spa_locations))
         if city and helper.is_request_for_spa_list(message):
-            matched_spas = helper.find_spas_by_city(spa_locations, city)
-            return helper.reply_spa_list(city, matched_spas, conversation_key, history)
+            return helper.reply_spa_list(city, helper.find_spas_by_city(spa_locations, city), conversation_key, history)
 
         # ===== 3) Tên spa → giới thiệu spa =====
         spa_names = list(spa_services.keys())
-        spa_name = helper.detect_spa_in_message(message, spa_names)
-        if spa_name and helper.is_request_for_spa_intro(message, spa_name):
-            return helper.reply_spa_intro(spa_name, spa_locations, conversation_key, history)
+        spa_from_msg = helper.detect_spa_in_message(message, spa_names)
+        if spa_from_msg and helper.is_request_for_spa_intro(message, spa_from_msg):
+            return helper.reply_spa_intro(spa_from_msg, spa_locations, conversation_key, history)
 
-        # ===== 4) Danh sách dịch vụ (LUÔN clear booking context để không dính giờ cũ) =====
+        # ===== 4) Danh sách dịch vụ (luôn clear slot cũ để không dính giờ) =====
         if helper.is_request_for_service_list(message):
-            target_spa = spa_name or ctx.get("spa_name") or cache.get(f"{conversation_key}:last_spa_focus")
-            helper.clear_booking_context(user_id)  # reset slot/confirmed/...
+            target_spa = spa_from_msg or ctx.get("spa_name") or cache.get(f"{conversation_key}:last_spa_focus")
+            helper.clear_booking_context(user_id)
             if target_spa:
                 return helper.reply_service_list(target_spa, spa_services, conversation_key, history)
-
             last_list = helper.get_last_spa_list(conversation_key)
             if last_list:
                 picked = helper.resolve_spa_selection_from_message(message, last_list)
-                if picked:
-                    return helper.reply_service_list(picked, spa_services, conversation_key, history)
+                if picked: return helper.reply_service_list(picked, spa_services, conversation_key, history)
                 return helper.reply_choose_spa_from_last_list(conversation_key, history, note="để xem danh sách dịch vụ")
-
             return helper.finalize_reply("Bạn muốn xem **danh sách dịch vụ** của **spa nào** ạ?", conversation_key, history)
 
-        # ===== 5) BOOKING (ƯU TIÊN TRƯỚC 'XEM LỊCH HẸN TỔNG') =====
+        # ===== 5) BOOKING (chỉ xác nhận khi đã đủ SPA + DỊCH VỤ + THỜI GIAN) =====
         if helper.is_booking_request(message) or ctx.get("active"):
-            # 5.a — ƯU TIÊN GIỜ MỚI NÓI; KHÔNG NÓI GIỜ → XÓA SLOT CŨ (tránh dính)
-            new_dt = helper.parse_datetime_from_message(message)
-            if helper.is_booking_request(message) and not ctx.get("active"):
-                # bắt đầu phiên booking mới
-                if new_dt:
-                    ctx["slot"] = {"label": new_dt.strftime("%d/%m/%Y %H:%M"), "iso": new_dt.isoformat()}
-                    ctx.pop("available_slots", None); ctx.pop("confirmed", None)
-                else:
-                    # không kèm giờ => xoá mọi thời gian cũ
-                    ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
-            else:
-                # đang ở phiên booking: nếu user nói giờ mới → cập nhật & xoá flag phụ
-                if new_dt:
-                    ctx["slot"] = {"label": new_dt.strftime("%d/%m/%Y %H:%M"), "iso": new_dt.isoformat()}
-                    ctx.pop("available_slots", None); ctx.pop("confirmed", None)
+            ctx["active"] = True
 
-            # 5.b0 — nếu vòng trước đã gợi ý danh sách dịch vụ → đọc lựa chọn lần này
+            # 5.a — KHÔNG để dính giờ cũ
+            has_time_expr = getattr(helper, "has_time_expression", lambda m: bool(helper.parse_datetime_from_message(m)))(message)
+            is_confirm = getattr(helper, "is_confirm_message", lambda m: False)(message)
+            if not has_time_expr and not is_confirm:
+                ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
+
+            new_dt = helper.parse_datetime_from_message(message)
+            if new_dt:
+                ctx["slot"] = {"label": new_dt.strftime("%d/%m/%Y %H:%M"), "iso": new_dt.isoformat()}
+                ctx.pop("available_slots", None); ctx.pop("confirmed", None)
+
+            # 5.b — Xác định SPA (từ câu nói > last_spa_focus)
+            if spa_from_msg and ctx.get("spa_name") != spa_from_msg:
+                ctx["spa_name"] = spa_from_msg
+                # đổi spa ⇒ must reset time to avoid accidental confirm
+                ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
+            if not ctx.get("spa_name"):
+                last_focus = cache.get(f"{conversation_key}:last_spa_focus")
+                if last_focus: ctx["spa_name"] = last_focus
+
+            # Nếu chưa biết spa → hỏi spa (KHÔNG đi tiếp)
+            if not ctx.get("spa_name"):
+                helper.set_booking_context(user_id, ctx)
+                last_list = helper.get_last_spa_list(conversation_key)
+                if last_list:
+                    return helper.reply_choose_spa_from_last_list(conversation_key, history, note="để tiến hành đặt hẹn")
+                short = [f"- **{s['name']}** — {s['address']}" for s in spa_locations]
+                return helper.finalize_reply(
+                    "Bạn muốn đặt tại **spa nào**? Bạn có thể trả lời tên spa.\n" + "\n".join(short[:8]),
+                    conversation_key, history
+                )
+
+            # 5.c — Bắt DỊCH VỤ (KHÔNG tự đoán)
+            # 1) Nếu vừa gợi ý candidates → đọc chọn
             if ctx.get("service_candidates") and not ctx.get("service_name"):
                 chosen = helper.resolve_service_selection_from_message(message, ctx["service_candidates"])
                 if chosen:
-                    # đổi dịch vụ ⇒ sạch giờ cũ
                     if ctx.get("service_name") and ctx["service_name"] != chosen:
                         ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
                     ctx["service_name"] = chosen
                     ctx.pop("service_candidates", None)
 
-            # 5.b1 — lấy DỊCH VỤ từ câu nói / 'dịch vụ này' / fuzzy
+            # 2) “dịch vụ này” → lấy từ last_context (nếu cùng spa), KHÔNG inference mơ hồ
+            if not ctx.get("service_name") and helper.is_referring_prev_service(message):
+                last = cache.get(f"{conversation_key}:last_context")
+                if last and (not last.get("spa_name") or last.get("spa_name") == ctx["spa_name"]):
+                    ctx["service_name"] = last.get("service_name")
+
+            # 3) Ưu tiên bắt tên dịch vụ xuất hiện rõ trong câu (chỉ trong spa hiện tại)
             if not ctx.get("service_name"):
-                if helper.is_referring_prev_service(message):
-                    last = cache.get(f"{conversation_key}:last_context")
-                    if last:
-                        ctx["service_name"] = last.get("service_name")
-                        ctx.setdefault("spa_name", last.get("spa_name"))
-
-                if not ctx.get("service_name"):
-                    mentioned = helper.find_services_in_text(message, spa_services)
-                    if mentioned:
-                        unique = sorted({m["service"]["name"] for m in mentioned})
-                        if len(unique) == 1:
-                            # đổi dịch vụ ⇒ sạch giờ cũ
-                            if ctx.get("service_name") and ctx["service_name"] != unique[0]:
-                                ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
-                            ctx["service_name"] = unique[0]
-                        else:
-                            ctx["service_candidates"] = unique
-                            helper.set_booking_context(user_id, {**ctx, "active": True})
-                            return helper.reply_choose_service(unique, conversation_key, history)
-
-            # 5.b2 — XÁC ĐỊNH SPA (từ message > last_spa_focus > theo dịch vụ)
-            if not ctx.get("spa_name"):
-                spa_from_msg = spa_name or helper.detect_spa_in_message(message, spa_names)
-                if spa_from_msg:
-                    # đổi spa ⇒ sạch giờ cũ
-                    if ctx.get("spa_name") and ctx["spa_name"] != spa_from_msg:
+                pick_in_spa = getattr(helper, "find_service_in_text_for_spa", lambda *_: None)(message, ctx["spa_name"])
+                if pick_in_spa:
+                    if ctx.get("service_name") and ctx["service_name"] != pick_in_spa:
                         ctx.pop("slot", None); ctx.pop("available_slots", None); ctx.pop("confirmed", None)
-                    ctx["spa_name"] = spa_from_msg
-                else:
-                    last_focus = cache.get(f"{conversation_key}:last_spa_focus")
-                    if last_focus:
-                        ctx["spa_name"] = last_focus
-                    elif ctx.get("service_name"):
-                        spas_for_service = helper.get_spas_by_service_name(ctx["service_name"])
-                        helper.set_booking_context(user_id, {**ctx, "active": True})
-                        if len(spas_for_service) == 0:
-                            return helper.finalize_reply(
-                                "Dịch vụ này hiện chưa có spa nào trong hệ thống. Bạn muốn chọn dịch vụ khác không?",
-                                conversation_key, history
-                            )
-                        elif len(spas_for_service) == 1:
-                            ctx["spa_name"] = spas_for_service[0]["name"]
-                        else:
-                            slot_label = ctx["slot"]["label"] if ctx.get("slot") else None
-                            return helper.reply_choose_spa_for_service(
-                                ctx["service_name"], spas_for_service, conversation_key, history, slot_label=slot_label
-                            )
-                    else:
-                        helper.set_booking_context(user_id, {**ctx, "active": True})
-                        return helper.finalize_reply(
-                            "Bạn muốn đặt **dịch vụ** nào và tại **spa** nào ạ? (Bạn có thể trả lời: 'tên dịch vụ + tên spa')",
-                            conversation_key, history
-                        )
+                    ctx["service_name"] = pick_in_spa
 
-            # 5.b3 — Nếu đã biết SPA mà CHƯA có dịch vụ → hỏi chọn dịch vụ của spa đó
-            # (ƯU TIÊN BẮT DỊCH VỤ TRONG PHẠM VI SPA TRƯỚC)
-            if ctx.get("spa_name") and not ctx.get("service_name"):
-                picked_in_spa = getattr(helper, "find_service_in_text_for_spa", lambda *_: None)(message, ctx["spa_name"])
-                if picked_in_spa:
-                    ctx["service_name"] = picked_in_spa
-                else:
-                    service_list = [s["name"] for s in spa_services.get(ctx["spa_name"], [])]
-                    ctx["service_candidates"] = service_list
-                    helper.set_booking_context(user_id, {**ctx, "active": True})
-                    return helper.reply_choose_service_for_spa(ctx["spa_name"], service_list, conversation_key, history)
+            # 4) Nếu vẫn chưa có dịch vụ → HỎI CHỌN (bắt buộc), không tự chọn default
+            if not ctx.get("service_name"):
+                service_list = [s["name"] for s in spa_services.get(ctx["spa_name"], [])]
+                if not service_list:
+                    helper.set_booking_context(user_id, ctx)
+                    return helper.finalize_reply(f"Hiện **{ctx['spa_name']}** chưa cập nhật dịch vụ. Bạn muốn chọn spa khác không?", conversation_key, history)
+                ctx["service_candidates"] = service_list
+                helper.set_booking_context(user_id, ctx)
+                return helper.reply_choose_service_for_spa(ctx["spa_name"], service_list, conversation_key, history)
 
-            # 5.c — Nếu CHƯA có slot → gợi ý slot
+            # 5.d — Nếu chưa có thời gian → gợi ý slot (KHÔNG xác nhận)
             if not ctx.get("slot"):
                 slots = helper.get_available_slots(ctx["spa_name"])
                 ctx["available_slots"] = slots
-                helper.set_booking_context(user_id, {**ctx, "active": True})
+                helper.set_booking_context(user_id, ctx)
                 return helper.ask_booking_info(slots, conversation_key, history)
 
-            # 5.d — Xác nhận (tên/điện thoại đã tắt theo yêu cầu)
+            # 5.e — Chỉ xác nhận khi đủ 3 trường: spa_name + service_name + slot
+            if not (ctx.get("spa_name") and ctx.get("service_name") and ctx.get("slot")):
+                helper.set_booking_context(user_id, ctx)
+                return helper.finalize_reply("Mình cần **tên dịch vụ** và **thời gian** để giữ chỗ nhé.", conversation_key, history)
+
+            # Nếu tin nhắn là “đồng ý” nhưng thiếu trường → bỏ qua xác nhận
+            if is_confirm and not (ctx.get("spa_name") and ctx.get("service_name") and ctx.get("slot")):
+                helper.set_booking_context(user_id, ctx)
+                return helper.finalize_reply("Bạn vui lòng chọn **dịch vụ** và **thời gian** trước khi xác nhận nhé.", conversation_key, history)
+
+            # 5.f — Hỏi xác nhận / hoặc xác nhận nếu user đã nói “đồng ý” sau khi ĐỦ thông tin
             filled, ctx, ask = helper.handle_booking_details(ctx, message)
-            helper.set_booking_context(user_id, {**ctx, "active": True})
+            helper.set_booking_context(user_id, ctx)
             if not filled:
                 return helper.finalize_reply(ask, conversation_key, history)
 
-            # 5.e — Lưu + clean context cũ (sạch hoàn toàn slot/flags cho lần đặt mới)
+            # 5.g — Lưu + clean context
             confirmation = helper.confirm_booking(ctx)
             helper.add_appointment(user_id, ctx)
             helper.clear_booking_context(user_id)
@@ -291,10 +264,10 @@ class MessageV2(BaseController, Resource):
         if helper.is_request_for_my_appointments(message):
             return helper.reply_my_appointments(user_id, conversation_key, history)
 
-        # ===== 7) Giới thiệu dịch vụ cụ thể (chỉ khi KHÔNG booking) =====
+        # ===== 7) Giới thiệu dịch vụ cụ thể (không booking) =====
         exact = helper.find_exact_service_by_name(message, spa_services)
         if exact and not helper.is_booking_request(message):
             return helper.reply_service_detail(exact, conversation_key, history)
 
-        # ===== 8) Fallback (GPT tư vấn chung) =====
+        # ===== 8) Fallback (GPT) =====
         return helper.reply_with_gpt_history(client, history, message, user_id)
